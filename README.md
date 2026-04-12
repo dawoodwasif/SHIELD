@@ -97,7 +97,7 @@ pip install sample-factory==2.0.3 gymnasium numpy torch numba scipy
 
 ## Training
 
-### Experiment 1: Nominal Benchmarking (Section 6.1)
+### Experiment 1: Nominal Benchmarking 
 
 Open field (no obstacles), 8 UAVs, all 5 methods:
 
@@ -111,7 +111,7 @@ Dense field (20% obstacles), 8 UAVs:
 bash train_local_hmt_comparison_obstacles.sh
 ```
 
-### Experiment 2: Intrusion Robustness (Section 6.2)
+### Experiment 2: Intrusion Robustness 
 
 All 6 attack classes, dense field, SHIELD with IRS enabled:
 
@@ -150,13 +150,12 @@ python -m swarm_rl.train --env=quadrotor_multi --hmt_approach=saho \
 
 ## Evaluation Metrics
 
-### Mission Metrics (Section 5.3)
-
+### Mission Metrics 
 - **CP** (Crash Penalty, Eq. 19): Cumulative collision reward; closer to zero is better.
 - **MSR** (Mission Success Rate, Eq. 20): Fraction of agents completing all waypoints without crashing.
 - **SR** (Survival Rate, Eq. 21): Fraction of crash-free agents at episode end.
 
-### Intrusion Metrics (Section 5.3)
+### Intrusion Metrics 
 
 - **DR** (Detection Rate, Eq. 22): Fraction of attacks detected within 5 s of onset.
 - **FPR** (False Positive Rate, Eq. 23): Fraction of benign timesteps incorrectly flagged.
