@@ -105,9 +105,6 @@ source shield_env/bin/activate
 python -m pip install --upgrade pip setuptools wheel
 
 pip install -e .
-
-# Dependencies
-pip install sample-factory==2.0.3 gymnasium numpy torch numba scipy
 ```
 
 ## Training
