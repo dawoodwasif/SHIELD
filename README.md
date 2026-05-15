@@ -112,6 +112,14 @@ pip install sample-factory==2.0.3 gymnasium numpy torch numba scipy
 
 ## Training
 
+Use this command to verify the SHIELD artifact without running the full training pipeline:
+
+```bash
+python -m swarm_rl.train --env=quadrotor_multi --hmt_approach=shield \
+    --quads_num_agents=8 --quads_neighbor_visible_num=0 \
+    --train_for_env_steps=100000 --experiment=sanity_check
+```
+
 ### Experiment 1: Nominal Benchmarking 
 
 Open field (no obstacles), 8 UAVs, all 5 methods:
