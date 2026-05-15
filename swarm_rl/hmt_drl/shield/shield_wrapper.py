@@ -13,33 +13,23 @@ the full SHIELD control loop each step:
     7. Execution
 
 It does NOT modify rewards -- the RL policy trains on the environment's
-native reward signal.  SHIELD's contribution is in action filtering
+native reward signal. SHIELD's contribution is in action filtering
 (safety override) and information fusion, not reward shaping.
 """
 
 import gymnasium as gym
 import numpy as np
-import os
-import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 
 from swarm_rl.hmt_drl.shield.node import (
     ShieldNode,
     EvidentialPerceptionNet,
-    Message,
     softmax,
-    kl_divergence,
     NUM_SEMANTIC_CLASSES,
-    DEFAULT_TAU_VAC,
-    DEFAULT_KAPPA,
-    DEFAULT_BETA,
-    DEFAULT_ZETA,
-    DEFAULT_EPSILON,
-    DEFAULT_DELTA,
     DT,
 )
 from swarm_rl.hmt_drl.shield.coverage import CoverageManager
-from swarm_rl.hmt_drl.shield.human_interface import HumanOracle, ORACLE_LATENCY_S
+from swarm_rl.hmt_drl.shield.human_interface import HumanOracle
 from swarm_rl.hmt_drl.shield.message_router import MessageRouter
 from swarm_rl.irs_security_evaluation import (
     AttackInjector,
@@ -49,17 +39,7 @@ from swarm_rl.irs_security_evaluation import (
 
 
 class ShieldWrapper(gym.Wrapper):
-    """SHIELD wrapper implementing Algorithm 1 around a multi-quadrotor env.
-
-    Parameters
-    ----------
-    env : gym.Env
-        The QuadSwarm multi-agent environment.
-    enable_irs : bool
-        If True, activate the Intrusion Response System with attack injection.
-    attack_config : AttackConfig or None
-        Custom attack parameters; defaults to Table 2 values.
-    """
+    """SHIELD wrapper implementing Algorithm 1 around a multi-quadrotor env."""
 
     def __init__(
         self,
@@ -71,22 +51,20 @@ class ShieldWrapper(gym.Wrapper):
 
         self.num_agents: int = getattr(env, "num_agents", 8)
 
-        # Determine obs / action dimensions from the environment
         obs_space = env.observation_space
-        if hasattr(obs_space, "shape"):
-            self.obs_dim = obs_space.shape[0]
+        if hasattr(obs_space, "shape") and obs_space.shape is not None:
+            self.obs_dim = int(obs_space.shape[0])
         else:
-            self.obs_dim = 18  # default xyz_vxyz_R_omega
+            self.obs_dim = 18
 
         act_space = env.action_space
         if hasattr(act_space, "n"):
-            self.num_actions = act_space.n
-        elif hasattr(act_space, "shape"):
-            self.num_actions = act_space.shape[0]
+            self.num_actions = int(act_space.n)
+        elif hasattr(act_space, "shape") and act_space.shape is not None:
+            self.num_actions = int(act_space.shape[0])
         else:
-            self.num_actions = 7  # paper default (Table 14)
+            self.num_actions = 7
 
-        # --- SHIELD nodes (one per UAV) ---
         self.nodes: Dict[int, ShieldNode] = {}
         for i in range(self.num_agents):
             self.nodes[i] = ShieldNode(
@@ -95,39 +73,31 @@ class ShieldWrapper(gym.Wrapper):
                 obs_dim=self.obs_dim,
             )
 
-        # --- Shared ENN (parameter sharing across UAVs, Section 5.6) ---
         self.shared_enn = EvidentialPerceptionNet(obs_dim=self.obs_dim)
         for node in self.nodes.values():
             node.enn = self.shared_enn
 
-        # --- Communication ---
         self.router = MessageRouter(nodes=self.nodes)
-
-        # --- Human Oracle (Section 5.4) ---
         self.oracle = HumanOracle()
-
-        # --- Coverage Manager (Section 4.4) ---
         self.coverage = CoverageManager(num_agents=self.num_agents)
 
-        # --- IRS / Attack Injection ---
         self.enable_irs = enable_irs
         self.attack_injector: Optional[AttackInjector] = None
         self.metrics_tracker = IRSMetricsTracker()
+
         if enable_irs:
             cfg = attack_config or AttackConfig()
             self.attack_injector = AttackInjector(self.num_agents, cfg)
 
-        # --- Simulation clock ---
         self.sim_time: float = 0.0
         self.sim_step: int = 0
 
-        # --- Metric accumulators ---
         self.episode_escalations: int = 0
         self.episode_overrides: int = 0
         self.episode_quarantines: int = 0
 
-        # TensorBoard (optional)
         self._tb_writer = None
+        self._last_obs = None
 
     # ------------------------------------------------------------------
     # Gym API
@@ -135,13 +105,15 @@ class ShieldWrapper(gym.Wrapper):
 
     def reset(self, **kwargs):
         result = self.env.reset(**kwargs)
+
         if isinstance(result, tuple) and len(result) == 2:
             obs, info = result
         else:
             obs = result
             info = {}
 
-        # Reset SHIELD state
+        self._last_obs = obs
+
         self.sim_time = 0.0
         self.sim_step = 0
         self.episode_escalations = 0
@@ -170,85 +142,71 @@ class ShieldWrapper(gym.Wrapper):
         return obs, info
 
     def step(self, actions):
-        """Execute one SHIELD-augmented timestep (Algorithm 1)."""
+        """Execute one SHIELD-augmented timestep."""
         self.sim_time += DT
         self.sim_step += 1
 
-        # Update node clocks
         for node in self.nodes.values():
             node.sim_time = self.sim_time
             node.sim_step = self.sim_step
 
-        # ----------------------------------------------------------------
-        # 0. Get current agent positions from the environment
-        # ----------------------------------------------------------------
         positions = self._get_positions()
-
-        # ----------------------------------------------------------------
-        # 1. Build per-agent observations dict
-        # ----------------------------------------------------------------
-        # The RL framework provides actions as a flat array or list;
-        # we need to distribute to per-agent.
         per_agent_actions = self._to_per_agent(actions)
 
-        # ----------------------------------------------------------------
-        # 2. Attack injection (if IRS enabled)
-        # ----------------------------------------------------------------
         jammed_links: Set[tuple] = set()
         byzantine_ids: Set[int] = set()
         intrusion_segment: Optional[Set[int]] = None
 
         if self.attack_injector is not None:
-            # Build obs dict from previous step's positions for attack injection
-            obs_dict = {i: positions.get(i, np.zeros(3)) for i in range(self.num_agents)}
-            act_dict = {i: per_agent_actions.get(i, np.zeros(self.num_actions))
-                        for i in range(self.num_agents)}
+            obs_dict = {
+                i: self._extract_agent_observation(self._last_obs, i)
+                for i in range(self.num_agents)
+            }
+            act_dict = {
+                i: per_agent_actions.get(i, np.zeros(self.num_actions))
+                for i in range(self.num_agents)
+            }
 
             _, corrupted_actions, jammed_links, byzantine_ids, intrusion_segment = (
                 self.attack_injector.step(self.sim_time, obs_dict, act_dict)
             )
 
-            # Apply malware-corrupted actions (A5)
             for aid, ca in corrupted_actions.items():
                 per_agent_actions[aid] = ca
 
-            # Feed attack state to router
             self.router.set_jammed_links(jammed_links)
             self.router.set_byzantine_agents(byzantine_ids)
             self.router.set_intrusion_segment(intrusion_segment)
 
-            # Record onsets for metrics
             for atype, onset_time, aid in self.attack_injector.attack_onset_times:
                 self.metrics_tracker.record_attack_onset(atype, onset_time, aid)
             self.attack_injector.attack_onset_times.clear()
 
-        # ----------------------------------------------------------------
-        # 3. SHIELD per-agent loop (Algorithm 1)
-        # ----------------------------------------------------------------
         # 3a. Evidential perception for each node
         for nid, node in self.nodes.items():
             if node.is_quarantined:
                 continue
-            obs_i = positions.get(nid, np.zeros(self.obs_dim))
-            node.state = obs_i[:3] if len(obs_i) >= 3 else obs_i.copy()
-            # Step 1: perception
+
+            obs_i = self._extract_agent_observation(self._last_obs, nid)
+            pos_i = positions.get(nid, np.zeros(3, dtype=np.float32))
+
+            node.state = pos_i[:3].copy()
+
             node.evidential_perception(obs_i)
 
-            # Step 2: local action proposal
             act_i = per_agent_actions.get(nid, np.zeros(self.num_actions))
             node.action_dist = softmax(act_i) if len(act_i) == self.num_actions else (
                 np.ones(self.num_actions) / self.num_actions
             )
 
-        # 3b. Communication (Step 3)
         delivered = self.router.deliver_messages(
             {nid: n.state for nid, n in self.nodes.items() if not n.is_quarantined}
         )
+
         for nid, msgs in delivered.items():
             if nid in self.nodes and not self.nodes[nid].is_quarantined:
                 self.nodes[nid].receive_messages(msgs)
 
-        # 3c. Trust update + quarantine (Step 4)
         all_quarantined: List[int] = []
         for nid, node in self.nodes.items():
             if node.is_quarantined:
@@ -257,17 +215,14 @@ class ShieldWrapper(gym.Wrapper):
             if q_list:
                 all_quarantined.extend(q_list)
 
-        # Execute quarantines
         for qid in set(all_quarantined):
             if qid in self.nodes and not self.nodes[qid].is_quarantined:
                 self.nodes[qid].is_quarantined = True
                 self.nodes[qid].quarantine_step = self.sim_step
                 self.episode_quarantines += 1
 
-                # Reassign coverage (Section 4.4)
                 self.coverage.reassign_coverage(qid)
 
-                # IRS metrics
                 if self.attack_injector is not None:
                     is_tp = qid in self.attack_injector.get_compromised_agents()
                     self.metrics_tracker.record_detection(
@@ -276,32 +231,29 @@ class ShieldWrapper(gym.Wrapper):
                     if not is_tp:
                         self.metrics_tracker.record_benign_step(is_flagged=True)
 
-        # 3d. Trust-weighted fusion + safety arbitration (Steps 5-6)
         final_actions = per_agent_actions.copy()
+
         for nid, node in self.nodes.items():
             if node.is_quarantined:
                 continue
 
-            # Step 5: fusion
             _, _, p_bar = node.trust_weighted_fusion()
 
-            # Step 6: safety arbitration
             pi_local = node.action_dist
             action_idx, overridden = node.safety_arbitration(pi_local, p_bar)
 
             if overridden:
                 self.episode_overrides += 1
 
-            # Vacuity-triggered escalation (Step 1, lines 4-6)
             if node.needs_escalation() and not node.escalation_pending:
                 node.escalation_pending = True
                 self.episode_escalations += 1
 
-                # Get oracle response
-                gt_label = None  # would come from ground-truth if available
+                gt_label = None
                 response = self.oracle.respond_to_escalation(
                     nid, node.belief, node.vacuity, gt_label
                 )
+
                 if response["corrected_belief"] is not None:
                     node.apply_human_correction(response["corrected_belief"])
                 else:
@@ -310,25 +262,15 @@ class ShieldWrapper(gym.Wrapper):
 
                 self.metrics_tracker.record_human_intervention()
 
-            # For discrete action spaces, convert index back; for continuous,
-            # use the action as-is (the override doesn't change the action
-            # format, only selects argmax of consensus).
-
-        # 3e. Reintegration check (Section 4.4)
         for nid, node in self.nodes.items():
             if node.is_quarantined:
-                # Check if reintegration criteria are met
-                node.evidential_perception(
-                    positions.get(nid, np.zeros(self.obs_dim))
-                )
-                # Simplified consistency: is vacuity low?
+                obs_i = self._extract_agent_observation(self._last_obs, nid)
+                node.evidential_perception(obs_i)
                 node.record_reintegration_consistency(node.vacuity <= node.tau_vac)
+
                 if node.check_reintegration(self.sim_step):
                     node.reintegrate()
 
-        # ----------------------------------------------------------------
-        # 4. Execute in environment (no action or reward modification)
-        # ----------------------------------------------------------------
         result = self.env.step(actions)
 
         if len(result) == 4:
@@ -340,9 +282,8 @@ class ShieldWrapper(gym.Wrapper):
         else:
             raise ValueError(f"Unexpected step return format: {len(result)} elements")
 
-        # ----------------------------------------------------------------
-        # 5. Attach SHIELD metrics to info
-        # ----------------------------------------------------------------
+        self._last_obs = obs
+
         shield_info = self._collect_metrics()
 
         if isinstance(infos, list):
@@ -352,7 +293,6 @@ class ShieldWrapper(gym.Wrapper):
         elif isinstance(infos, dict):
             infos["shield"] = shield_info
 
-        # Benign-step tracking for FPR
         if self.attack_injector is not None:
             compromised = self.attack_injector.get_compromised_agents()
             for nid in range(self.num_agents):
@@ -366,28 +306,66 @@ class ShieldWrapper(gym.Wrapper):
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _extract_agent_observation(self, obs, agent_id: int) -> np.ndarray:
+        """
+        Return a full obs_dim vector for the requested agent.
+
+        Important:
+        positions are only 3D, but the SHIELD ENN expects obs_dim features,
+        usually 18 for xyz_vxyz_R_omega.
+        """
+        if obs is None:
+            return np.zeros(self.obs_dim, dtype=np.float32)
+
+        if isinstance(obs, dict):
+            obs = obs.get("obs", obs)
+
+        arr = np.asarray(obs, dtype=np.float32)
+
+        if arr.ndim == 1:
+            vec = arr
+        elif arr.ndim == 2:
+            vec = arr[min(agent_id, arr.shape[0] - 1)]
+        elif arr.ndim >= 3:
+            flat = arr.reshape(arr.shape[0], -1)
+            vec = flat[min(agent_id, flat.shape[0] - 1)]
+        else:
+            vec = np.zeros(self.obs_dim, dtype=np.float32)
+
+        if vec.shape[0] == self.obs_dim:
+            return vec.astype(np.float32)
+
+        fixed = np.zeros(self.obs_dim, dtype=np.float32)
+        n = min(self.obs_dim, vec.shape[0])
+        fixed[:n] = vec[:n]
+        return fixed
+
     def _get_positions(self) -> Dict[int, np.ndarray]:
-        """Extract 3-D positions from the environment state."""
+        """Extract 3D positions from the environment state."""
         positions = {}
+
         if hasattr(self.env, "pos") and self.env.pos is not None:
             for i in range(min(self.num_agents, len(self.env.pos))):
-                positions[i] = self.env.pos[i].copy()
+                positions[i] = np.asarray(self.env.pos[i], dtype=np.float32).copy()
         else:
-            # Fallback: zeros
             for i in range(self.num_agents):
-                positions[i] = np.zeros(3)
+                positions[i] = np.zeros(3, dtype=np.float32)
+
         return positions
 
     def _to_per_agent(self, actions) -> Dict[int, np.ndarray]:
         """Convert flat/list actions to per-agent dict."""
         result = {}
+
         if isinstance(actions, dict):
             return {int(k): np.asarray(v, dtype=np.float32) for k, v in actions.items()}
+
         actions_arr = np.asarray(actions, dtype=np.float32)
+
         if actions_arr.ndim == 0:
-            # Single scalar action
             for i in range(self.num_agents):
                 result[i] = actions_arr.reshape(-1)
+
         elif actions_arr.ndim == 1:
             if len(actions_arr) == self.num_agents:
                 for i in range(self.num_agents):
@@ -395,12 +373,15 @@ class ShieldWrapper(gym.Wrapper):
             else:
                 for i in range(self.num_agents):
                     result[i] = actions_arr.copy()
+
         elif actions_arr.ndim == 2:
             for i in range(min(self.num_agents, len(actions_arr))):
                 result[i] = actions_arr[i].copy()
+
         else:
             for i in range(self.num_agents):
                 result[i] = np.zeros(self.num_actions, dtype=np.float32)
+
         return result
 
     def _collect_metrics(self) -> Dict[str, Any]:
@@ -414,10 +395,12 @@ class ShieldWrapper(gym.Wrapper):
 
         avg_trust = 0.0
         trust_count = 0
+
         for n in self.nodes.values():
             for edge in n.neighbors.values():
                 avg_trust += edge.trust
                 trust_count += 1
+
         avg_trust = avg_trust / max(1, trust_count)
 
         metrics = {
@@ -439,7 +422,7 @@ class ShieldWrapper(gym.Wrapper):
         return metrics
 
     # ------------------------------------------------------------------
-    # Public API for external metric queries
+    # Public API
     # ------------------------------------------------------------------
 
     def get_metrics(self) -> Dict[str, Any]:
@@ -447,7 +430,7 @@ class ShieldWrapper(gym.Wrapper):
         return self._collect_metrics()
 
     def get_irs_results(self) -> Dict[str, float]:
-        """Return IRS evaluation metrics (Eqs. 22-25)."""
+        """Return IRS evaluation metrics."""
         return self.metrics_tracker.compute_metrics()
 
     def close(self):
