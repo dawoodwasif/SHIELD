@@ -85,10 +85,25 @@ SHIELD/
 
 ## Installation
 
+
+Recommended environment:
+
+- Ubuntu 22.04
+- Python 3.11.15
+- CUDA-capable NVIDIA GPU
+- `build-essential`
+
 ```bash
-# Clone and install
+sudo apt update
+sudo apt install -y build-essential python3.11 python3.11-venv python3.11-dev
+
 git clone https://github.com/dawoodwasif/SHIELD.git
 cd SHIELD
+
+python3.11 -m venv shield_env
+source shield_env/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+
 pip install -e .
 
 # Dependencies
@@ -172,11 +187,6 @@ tensorboard --logdir=./train_dir/
 python -m swarm_rl.plot_irs_results
 ```
 
-## Unit Tests
-
-```bash
-python -m swarm_rl.sim2real.tests.unit_tests
-```
 
 ## Baselines
 
